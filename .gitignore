@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/viddoblaje/
+*.egg-info/
+.pytest_cache/
+*.mp4
+*.wav
+*.onnx
+!tests/fixtures/*.mp4
+build/ffmpeg/*.exe
+build/ffmpeg/*.dll

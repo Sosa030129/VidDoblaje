@@ -1,0 +1,162 @@
+name: Windows CI - Build & Test
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build-and-test-windows:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pefile
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          echo "C:\Program Files (x86)\NSIS" >> $env:GITHUB_PATH
+
+      - name: Download FFmpeg (Windows LGPL)
+        shell: pwsh
+        run: |
+          mkdir -p build/ffmpeg
+          curl -L -o build/ffmpeg/ffmpeg.zip https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip
+          cd build/ffmpeg
+          unzip -q ffmpeg.zip
+          $dir = Get-ChildItem -Directory -Filter "ffmpeg-*" | Select-Object -First 1
+          Move-Item "$($dir.FullName)\bin\*" .
+          Remove-Item -Recurse -Force $dir, ffmpeg.zip
+
+      - name: Generate app icon
+        shell: pwsh
+        run: |
+          pip install pillow
+          python -c "
+          from PIL import Image, ImageDraw, ImageFont
+          img = Image.new('RGBA', (256, 256), (0,0,0,0))
+          draw = ImageDraw.Draw(img)
+          draw.rounded_rectangle([20,20,236,236], radius=40, fill=(74,127,255,255))
+          try:
+              font = ImageFont.truetype('C:\Windows\Fonts\arialbd.ttf', 130)
+          except: font = ImageFont.load_default()
+          text = 'VD'
+          bbox = draw.textbbox((0,0), text, font=font)
+          tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+          draw.text(((256-tw)/2, (256-th)/2-15), text, fill='white', font=font)
+          img.save('assets/icon.ico', sizes=[(256,256),(128,128),(64,64),(48,48),(32,32),(16,16)])
+          print('Icon generated')
+          "
+
+      - name: Run quick tests
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = "src;."
+          python -m pytest tests/test_core.py tests/test_stages.py -v --tb=short -m "not needs_models and not gpu"
+
+      - name: Build VidDoblaje.exe
+        shell: pwsh
+        run: |
+          pyinstaller viddoblaje.spec --noconfirm
+          if (-not (Test-Path "dist\VidDoblaje\VidDoblaje.exe")) { throw "VidDoblaje.exe not found" }
+          Write-Host "✓ VidDoblaje.exe built"
+
+      - name: Verify VidDoblaje.exe is PE32
+        shell: pwsh
+        run: |
+          $exe = "dist\VidDoblaje\VidDoblaje.exe"
+          $bytes = [System.IO.File]::ReadAllBytes($exe)[0..1]
+          $magic = [System.Text.Encoding]::ASCII.GetString($bytes)
+          if ($magic -ne "MZ") { throw "Not a valid PE32" }
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "✓ VidDoblaje.exe is valid PE32 ($size MB)"
+
+      - name: Run VidDoblaje.exe smoke test
+        shell: pwsh
+        run: |
+          $env:HOME = $env:LOCALAPPDATA
+          & "dist\VidDoblaje\VidDoblaje.exe" --cli --list-models 2>&1 | Tee-Object -Variable output
+          if ($LASTEXITCODE -ne 0) { throw "VidDoblaje.exe failed" }
+          if (-not ($output -match "whisper-base")) { throw "Output missing expected content" }
+          Write-Host "✓ VidDoblaje.exe runs correctly"
+
+      - name: Build VidDoblajeSetup.exe
+        shell: pwsh
+        run: |
+          mkdir -p dist/Output
+          & "C:\Program Files (x86)\NSIS\makensis.exe" scripts/viddoblaje.nsi
+          if (-not (Test-Path "dist\Output\VidDoblajeSetup.exe")) { throw "Installer not built" }
+          Write-Host "✓ VidDoblajeSetup.exe built"
+
+      - name: Install VidDoblaje (silent)
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "dist\Output\VidDoblajeSetup.exe" -ArgumentList "/S" -Wait
+          Write-Host "✓ Installation completed"
+
+      - name: Verify installation
+        shell: pwsh
+        run: |
+          $dir = "$env:LOCALAPPDATA\VidDoblaje"
+          if (-not (Test-Path "$dir\VidDoblaje.exe")) { throw "VidDoblaje.exe not found after install" }
+          if (-not (Test-Path "$dir\uninstall.exe")) { throw "Uninstaller not found" }
+          Write-Host "✓ Installation verified"
+
+      - name: Run installed VidDoblaje.exe
+        shell: pwsh
+        run: |
+          $env:HOME = $env:LOCALAPPDATA
+          & "$env:LOCALAPPDATA\VidDoblaje\VidDoblaje.exe" --cli --list-models 2>&1 | Tee-Object -Variable output
+          if ($LASTEXITCODE -ne 0) { throw "Installed VidDoblaje failed" }
+          if (-not ($output -match "whisper-base")) { throw "Output missing expected content" }
+          Write-Host "✓ Installed VidDoblaje.exe runs"
+
+      - name: Uninstall VidDoblaje
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "$env:LOCALAPPDATA\VidDoblaje\uninstall.exe" -ArgumentList "/S" -Wait
+          Write-Host "✓ Uninstallation completed"
+
+      - name: Verify uninstallation
+        shell: pwsh
+        run: |
+          if (Test-Path "$env:LOCALAPPDATA\VidDoblaje\VidDoblaje.exe") { throw "VidDoblaje.exe still exists" }
+          Write-Host "✓ Uninstallation verified: no residue"
+
+      - name: Upload VidDoblajeSetup.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: VidDoblajeSetup-windows
+          path: dist/Output/VidDoblajeSetup.exe
+          retention-days: 30
+
+      - name: Upload VidDoblaje.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: VidDoblaje-windows
+          path: dist/VidDoblaje/
+          retention-days: 30
